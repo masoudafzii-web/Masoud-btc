@@ -1,0 +1,48 @@
+name: BTC WEEX Trading Bot
+
+on:
+  workflow_dispatch: {}
+  # cron غیرفعاله فعلاً - فقط دستی تست می‌کنیم تا مطمئن بشیم درست کار می‌کنه
+  # بعد از تست موفق، این خط رو از کامنت درار:
+  # schedule:
+  #   - cron: "*/5 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install ccxt requests
+
+      - name: Run trading bot
+        env:
+          WEEX_API_KEY: ${{ secrets.WEEX_API_KEY }}
+          WEEX_SECRET_KEY: ${{ secrets.WEEX_SECRET_KEY }}
+          WEEX_PASSPHRASE: ${{ secrets.WEEX_PASSPHRASE }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: python btc_weex_bot.py
+
+      - name: Commit updated state (if changed)
+        run: |
+          if [ -f state.json ]; then
+            git config user.name "weex-bot"
+            git config user.email "weex-bot@users.noreply.github.com"
+            git add state.json
+            git diff --staged --quiet || git commit -m "update state"
+            git push
+          else
+            echo "No state.json yet, nothing to commit."
+          fi
