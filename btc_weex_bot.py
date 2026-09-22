@@ -158,8 +158,17 @@ def main():
     except Exception as e:
         print(f"Could not set margin mode (may already be set): {e}")
 
+    # WEEX requires isolatedLongLeverage / isolatedShortLeverage explicitly when
+    # margin mode is "isolated" - ccxt's unified set_leverage() does not fill
+    # these in automatically, which is what caused the -1141 error.
     try:
-        exchange.set_leverage(LEVERAGE, SYMBOL)
+        exchange.set_leverage(
+            LEVERAGE, SYMBOL,
+            params={
+                "isolatedLongLeverage": LEVERAGE,
+                "isolatedShortLeverage": LEVERAGE,
+            },
+        )
     except Exception as e:
         print(f"Could not set leverage (may already be set): {e}")
 
