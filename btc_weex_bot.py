@@ -33,7 +33,8 @@ ATR_SL_MULT  = 1.5
 ATR_TP_MULT  = 3.0
 
 LEVERAGE       = 3          # deliberately low leverage despite exchange allowing much more
-RISK_PER_TRADE = 0.005      # 0.5% of account equity per trade
+MARGIN_MODE    = "isolated" # isolated, not cross - limits risk to this position's margin only
+FIXED_TRADE_USD = 2.0       # fixed position size in USD (notional), regardless of account equity
 STATE_FILE     = "state.json"
 
 # ---------------------------------------------------------------------------
@@ -153,6 +154,11 @@ def main():
     exchange.load_markets()
 
     try:
+        exchange.set_margin_mode(MARGIN_MODE, SYMBOL)
+    except Exception as e:
+        print(f"Could not set margin mode (may already be set): {e}")
+
+    try:
         exchange.set_leverage(LEVERAGE, SYMBOL)
     except Exception as e:
         print(f"Could not set leverage (may already be set): {e}")
@@ -216,11 +222,11 @@ def main():
         tp_price = price - tp_dist
         side = "sell"
 
-    # ---- Position sizing based on account equity and % risk ----
+    # ---- Position sizing: fixed USD notional, regardless of account equity ----
     balance = exchange.fetch_balance()
     equity = balance["total"].get("USDT", 0)
-    risk_amount = equity * RISK_PER_TRADE
-    amount = risk_amount / sl_dist  # BTC quantity such that hitting SL loses ~RISK_PER_TRADE of equity
+    amount = FIXED_TRADE_USD / price  # BTC quantity worth exactly FIXED_TRADE_USD at current price
+    risk_amount = amount * sl_dist    # actual USD loss if SL is hit, for reporting only
 
     if amount <= 0 or equity <= 0:
         print(f"Invalid size/equity. equity={equity} amount={amount}")
@@ -229,6 +235,7 @@ def main():
     order = exchange.create_order(
         SYMBOL, "market", side, amount,
         params={
+            "marginMode": MARGIN_MODE,
             "stopLoss": {"triggerPrice": sl_price},
             "takeProfit": {"triggerPrice": tp_price},
         },
@@ -240,10 +247,10 @@ def main():
     msg = (
         f"{emoji} سیگنال {signal} روی BTC/USDT (M5)\n"
         f"قیمت ورود: {price:.1f}\n"
-        f"اندازه پوزیشن: {amount:.5f} BTC (اهرم {LEVERAGE}x)\n"
+        f"اندازه پوزیشن: {amount:.5f} BTC (~{FIXED_TRADE_USD:.2f} USDT, اهرم {LEVERAGE}x, {MARGIN_MODE})\n"
         f"حد ضرر: {sl_price:.1f} | حد سود: {tp_price:.1f}\n"
         f"RSI: {rsi_vals[-1]:.1f} | ATR: {atr_val:.1f}\n"
-        f"ریسک این معامله: {RISK_PER_TRADE*100:.1f}% از حساب (~{risk_amount:.2f} USDT)\n"
+        f"ریسک این معامله در صورت خوردن حد ضرر: ~{risk_amount:.2f} USDT\n"
     )
     if ai_note:
         msg += f"\n🤖 تحلیل هوش مصنوعی:\n{ai_note}\n"
