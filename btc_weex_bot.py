@@ -1,10 +1,13 @@
 """
-BTC/USDT Automated Trading Bot for WEEX (Futures/Swap) -> EMA+RSI trend-filtered strategy.
-Runs on a schedule via GitHub Actions. Places REAL orders with REAL money.
+Multi-Symbol Automated Trading Bot for WEEX (Futures/Swap) -> EMA+RSI trend-filtered strategy.
+Runs on a schedule via GitHub Actions. Places REAL orders with REAL money, on
+multiple symbols independently (each symbol has its own position/state).
 
 ⚠ Educational template. Not financial advice. Test extensively with tiny size
 before trusting this with real capital. You are fully responsible for
-whatever this bot does to your account.
+whatever this bot does to your account. Running more symbols means more
+simultaneous real-money positions -> higher total exposure. Adjust
+FIXED_TRADE_USD accordingly if you want to keep total risk the same.
 """
 
 import os
@@ -22,7 +25,16 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
 GROQ_API_KEY       = os.environ.get("GROQ_API_KEY")
 
-SYMBOL       = "BTC/USDT:USDT"   # ccxt unified symbol for WEEX USDT-margined perpetual
+# ccxt unified symbols for WEEX USDT-margined perpetuals. Remove/add as needed.
+SYMBOLS = [
+    "BTC/USDT:USDT",
+    "SOL/USDT:USDT",
+    "BNB/USDT:USDT",
+    "XRP/USDT:USDT",
+    "LTC/USDT:USDT",
+    "DOGE/USDT:USDT",
+]
+
 TIMEFRAME    = "5m"
 EMA_FAST     = 9
 EMA_SLOW     = 21
@@ -32,10 +44,13 @@ ATR_PERIOD   = 14
 ATR_SL_MULT  = 1.5
 ATR_TP_MULT  = 3.0
 
-LEVERAGE       = 3          # deliberately low leverage despite exchange allowing much more
-MARGIN_MODE    = "isolated" # isolated, not cross - limits risk to this position's margin only
-FIXED_TRADE_USD = 2.0       # fixed position size in USD (notional), regardless of account equity
-STATE_FILE     = "state.json"
+LEVERAGE        = 3          # deliberately low leverage despite exchange allowing much more
+MARGIN_MODE     = "isolated" # isolated, not cross - limits risk to this position's margin only
+FIXED_TRADE_USD = 2.0        # fixed position size in USD (notional) PER SYMBOL, regardless of account equity
+STATE_FILE      = "state.json"
+
+# Small delay between symbols to be gentle on rate limits / avoid bursts.
+SYMBOL_DELAY_SEC = 1.0
 
 # ---------------------------------------------------------------------------
 
@@ -106,10 +121,19 @@ def atr(highs, lows, closes, period=ATR_PERIOD):
 
 
 def load_state():
+    """State is now keyed per symbol: {symbol: {"last_candle":.., "position_open":..}}"""
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
-            return json.load(f)
-    return {"last_candle": None, "position_open": False}
+            data = json.load(f)
+        # Migrate old single-symbol state file format if found.
+        if "last_candle" in data or "position_open" in data:
+            print("Old single-symbol state file detected - migrating to BTC entry.")
+            data = {"BTC/USDT:USDT": {
+                "last_candle": data.get("last_candle"),
+                "position_open": data.get("position_open", False),
+            }}
+        return data
+    return {}
 
 
 def save_state(state):
@@ -117,14 +141,14 @@ def save_state(state):
         json.dump(state, f)
 
 
-def get_ai_analysis(signal, price, sl, tp, rsi_val, atr_val, closes):
+def get_ai_analysis(symbol, signal, price, sl, tp, rsi_val, atr_val, closes):
     if not GROQ_API_KEY:
         return None
-    recent = ", ".join(f"{c:.1f}" for c in closes[-10:])
+    recent = ", ".join(f"{c:.4f}" for c in closes[-10:])
     prompt = (
-        f"یک سیگنال معاملاتی خودکار روی بیت‌کوین (BTC/USDT) بر اساس EMA+RSI صادر شده:\n"
-        f"جهت: {signal}\nقیمت: {price:.1f}\nRSI: {rsi_val:.1f}\nATR: {atr_val:.1f}\n"
-        f"حد ضرر: {sl:.1f} | حد سود: {tp:.1f}\nقیمت‌های اخیر: {recent}\n\n"
+        f"یک سیگنال معاملاتی خودکار روی {symbol} بر اساس EMA+RSI صادر شده:\n"
+        f"جهت: {signal}\nقیمت: {price}\nRSI: {rsi_val:.1f}\nATR: {atr_val}\n"
+        f"حد ضرر: {sl} | حد سود: {tp}\nقیمت‌های اخیر: {recent}\n\n"
         f"در حداکثر ۳ جمله‌ی فارسی خلاصه بگو این سیگنال با روند اخیر هم‌راستاست یا نه. "
         f"لحن محتاطانه، نه توصیه قطعی."
     )
@@ -132,7 +156,7 @@ def get_ai_analysis(signal, price, sl, tp, rsi_val, atr_val, closes):
         resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "llama-3.3-70b-versatile",
+            json={"model": "openai/gpt-oss-120b",
                   "messages": [{"role": "user", "content": prompt}], "max_tokens": 300},
             timeout=60,
         )
@@ -149,30 +173,27 @@ def send_telegram(message):
     r.raise_for_status()
 
 
-def main():
-    exchange = get_exchange()
-    exchange.load_markets()
+def process_symbol(exchange, symbol, state):
+    """Run the strategy for a single symbol. Mutates state[symbol] in place."""
+    sym_state = state.setdefault(symbol, {"last_candle": None, "position_open": False})
 
     try:
-        exchange.set_margin_mode(MARGIN_MODE, SYMBOL)
+        exchange.set_margin_mode(MARGIN_MODE, symbol)
     except Exception as e:
-        print(f"Could not set margin mode (may already be set): {e}")
+        print(f"[{symbol}] Could not set margin mode (may already be set): {e}")
 
-    # WEEX requires isolatedLongLeverage / isolatedShortLeverage explicitly when
-    # margin mode is "isolated" - ccxt's unified set_leverage() does not fill
-    # these in automatically, which is what caused the -1141 error.
     try:
         exchange.set_leverage(
-            LEVERAGE, SYMBOL,
+            LEVERAGE, symbol,
             params={
                 "isolatedLongLeverage": LEVERAGE,
                 "isolatedShortLeverage": LEVERAGE,
             },
         )
     except Exception as e:
-        print(f"Could not set leverage (may already be set): {e}")
+        print(f"[{symbol}] Could not set leverage (may already be set): {e}")
 
-    ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=250)
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=250)
     closes = [c[4] for c in ohlcv]
     highs  = [c[2] for c in ohlcv]
     lows   = [c[3] for c in ohlcv]
@@ -185,19 +206,17 @@ def main():
     atr_vals = atr(highs, lows, closes)
 
     if any(v[-1] is None or v[-2] is None for v in (ema_fast, ema_slow, ema_trend, rsi_vals, atr_vals)):
-        print("Not enough data yet.")
+        print(f"[{symbol}] Not enough data yet.")
         return
 
-    state = load_state()
     last_candle_time = times[-1]
-    if state.get("last_candle") == last_candle_time:
-        print("Already checked this candle, skipping.")
+    if sym_state.get("last_candle") == last_candle_time:
+        print(f"[{symbol}] Already checked this candle, skipping.")
         return
 
-    if state.get("position_open"):
-        print("Position already open, not opening a new one.")
-        state["last_candle"] = last_candle_time
-        save_state(state)
+    if sym_state.get("position_open"):
+        print(f"[{symbol}] Position already open, not opening a new one.")
+        sym_state["last_candle"] = last_candle_time
         return
 
     price = closes[-1]
@@ -213,9 +232,8 @@ def main():
         signal = "SELL"
 
     if not signal:
-        print(f"No signal. RSI={rsi_vals[-1]:.1f} price={price:.1f}")
-        state["last_candle"] = last_candle_time
-        save_state(state)
+        print(f"[{symbol}] No signal. RSI={rsi_vals[-1]:.1f} price={price}")
+        sym_state["last_candle"] = last_candle_time
         return
 
     atr_val = atr_vals[-1]
@@ -231,18 +249,15 @@ def main():
         tp_price = price - tp_dist
         side = "sell"
 
-    # ---- Position sizing: fixed USD notional, regardless of account equity ----
-    balance = exchange.fetch_balance()
-    equity = balance["total"].get("USDT", 0)
-    amount = FIXED_TRADE_USD / price  # BTC quantity worth exactly FIXED_TRADE_USD at current price
-    risk_amount = amount * sl_dist    # actual USD loss if SL is hit, for reporting only
+    amount = FIXED_TRADE_USD / price
+    risk_amount = amount * sl_dist
 
-    if amount <= 0 or equity <= 0:
-        print(f"Invalid size/equity. equity={equity} amount={amount}")
+    if amount <= 0:
+        print(f"[{symbol}] Invalid amount={amount}")
         return
 
     order = exchange.create_order(
-        SYMBOL, "market", side, amount,
+        symbol, "market", side, amount,
         params={
             "marginMode": MARGIN_MODE,
             "stopLoss": {"triggerPrice": sl_price},
@@ -250,15 +265,15 @@ def main():
         },
     )
 
-    ai_note = get_ai_analysis(signal, price, sl_price, tp_price, rsi_vals[-1], atr_val, closes)
+    ai_note = get_ai_analysis(symbol, signal, price, sl_price, tp_price, rsi_vals[-1], atr_val, closes)
 
     emoji = "🟢" if signal == "BUY" else "🔴"
     msg = (
-        f"{emoji} سیگنال {signal} روی BTC/USDT (M5)\n"
-        f"قیمت ورود: {price:.1f}\n"
-        f"اندازه پوزیشن: {amount:.5f} BTC (~{FIXED_TRADE_USD:.2f} USDT, اهرم {LEVERAGE}x, {MARGIN_MODE})\n"
-        f"حد ضرر: {sl_price:.1f} | حد سود: {tp_price:.1f}\n"
-        f"RSI: {rsi_vals[-1]:.1f} | ATR: {atr_val:.1f}\n"
+        f"{emoji} سیگنال {signal} روی {symbol} (M5)\n"
+        f"قیمت ورود: {price}\n"
+        f"اندازه پوزیشن: {amount:.6f} (~{FIXED_TRADE_USD:.2f} USDT, اهرم {LEVERAGE}x, {MARGIN_MODE})\n"
+        f"حد ضرر: {sl_price} | حد سود: {tp_price}\n"
+        f"RSI: {rsi_vals[-1]:.1f} | ATR: {atr_val}\n"
         f"ریسک این معامله در صورت خوردن حد ضرر: ~{risk_amount:.2f} USDT\n"
     )
     if ai_note:
@@ -266,16 +281,32 @@ def main():
     msg += f"\n⚠ معامله به‌صورت خودکار ثبت شد. Order ID: {order.get('id', 'N/A')}"
 
     send_telegram(msg)
-    print(f"Opened {signal} position. size={amount:.5f} SL={sl_price:.1f} TP={tp_price:.1f}")
+    print(f"[{symbol}] Opened {signal} position. size={amount:.6f} SL={sl_price} TP={tp_price}")
 
-    state["last_candle"] = last_candle_time
-    state["position_open"] = True
-    save_state(state)
+    sym_state["last_candle"] = last_candle_time
+    sym_state["position_open"] = True
+
+
+def main():
+    exchange = get_exchange()
+    exchange.load_markets()
+    state = load_state()
+
+    for symbol in SYMBOLS:
+        try:
+            process_symbol(exchange, symbol, state)
+        except Exception as e:
+            # One symbol failing (e.g. bad market data, API hiccup) should not
+            # stop the others from being checked.
+            print(f"[{symbol}] Error: {e}", file=sys.stderr)
+        finally:
+            save_state(state)  # persist progress after each symbol, not just at the end
+        time.sleep(SYMBOL_DELAY_SEC)
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(f"Fatal error: {e}", file=sys.stderr)
         sys.exit(1)
