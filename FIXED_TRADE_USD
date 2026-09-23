@@ -256,25 +256,46 @@ def process_symbol(exchange, symbol, state):
         print(f"[{symbol}] Invalid amount={amount}")
         return
 
-    order = exchange.create_order(
-        symbol, "market", side, amount,
-        params={
-            "marginMode": MARGIN_MODE,
-            "stopLoss": {"triggerPrice": sl_price},
-            "takeProfit": {"triggerPrice": tp_price},
-        },
-    )
-
-    ai_note = get_ai_analysis(symbol, signal, price, sl_price, tp_price, rsi_vals[-1], atr_val, closes)
-
     emoji = "🟢" if signal == "BUY" else "🔴"
-    msg = (
-        f"{emoji} سیگنال {signal} روی {symbol} (M5)\n"
+    base_info = (
         f"قیمت ورود: {price}\n"
         f"اندازه پوزیشن: {amount:.6f} (~{FIXED_TRADE_USD:.2f} USDT, اهرم {LEVERAGE}x, {MARGIN_MODE})\n"
         f"حد ضرر: {sl_price} | حد سود: {tp_price}\n"
         f"RSI: {rsi_vals[-1]:.1f} | ATR: {atr_val}\n"
         f"ریسک این معامله در صورت خوردن حد ضرر: ~{risk_amount:.2f} USDT\n"
+    )
+
+    try:
+        order = exchange.create_order(
+            symbol, "market", side, amount,
+            params={
+                "marginMode": MARGIN_MODE,
+                "stopLoss": {"triggerPrice": sl_price},
+                "takeProfit": {"triggerPrice": tp_price},
+            },
+        )
+    except Exception as e:
+        # Order failed (e.g. insufficient balance) - still notify via Telegram
+        # instead of only leaving it in the GitHub Actions log. Position is
+        # NOT marked open, and last_candle is intentionally not updated so
+        # the same candle can be retried if the failure was transient.
+        fail_msg = (
+            f"⚠️ سیگنال {signal} روی {symbol} (M5) صادر شد ولی سفارش ثبت نشد\n"
+            f"{base_info}\n"
+            f"دلیل خطا: {e}"
+        )
+        try:
+            send_telegram(fail_msg)
+        except Exception as tg_err:
+            print(f"[{symbol}] Also failed to send Telegram failure notice: {tg_err}")
+        print(f"[{symbol}] Order failed: {e}", file=sys.stderr)
+        return
+
+    ai_note = get_ai_analysis(symbol, signal, price, sl_price, tp_price, rsi_vals[-1], atr_val, closes)
+
+    msg = (
+        f"{emoji} سیگنال {signal} روی {symbol} (M5)\n"
+        f"{base_info}"
     )
     if ai_note:
         msg += f"\n🤖 تحلیل هوش مصنوعی:\n{ai_note}\n"
